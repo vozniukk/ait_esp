@@ -1,0 +1,68 @@
+; PlatformIO Project Configuration File
+;
+; Copy this file to platformio.ini and fill in your credentials.
+; platformio.ini is gitignored to protect secrets.
+;
+; Please visit documentation for the other options and examples
+; https://docs.platformio.org/page/projectconf.html
+
+; Shared settings for all environments
+[env]
+platform = espressif32
+board = esp32dev
+framework = arduino
+upload_port = COM5
+upload_protocol = esptool
+upload_speed = 115200
+monitor_speed = 115200
+lib_deps =
+    knolleary/PubSubClient@^2.8
+    adafruit/Adafruit AHTX0@^2.0.5
+    dfrobot/DFRobot_ENS160@^1.0.0
+    adafruit/Adafruit BMP280 Library@^2.6.0
+    adafruit/Adafruit Unified Sensor@^1.1.14
+    sensirion/Sensirion I2C SCD4x@^0.4.0
+    bblanchon/ArduinoJson@^7.2.0
+    adafruit/Adafruit CCS811 Library@^1.1.0
+    zinggjm/GxEPD2@^1.6.2
+    adafruit/Adafruit GFX Library@^1.11.9
+build_flags =
+    -DMQTT_HOST=\"YOUR_MQTT_HOST\"
+    -DMQTT_PORT=1883
+    -DMQTT_USER=\"YOUR_MQTT_USER\"
+    -DMQTT_PASS=\"YOUR_MQTT_PASSWORD\"
+    -DMQTT_TOPIC=\"sensors/esp32\"
+    ; ↓ Set your location coordinates for Open-Meteo outdoor weather reference
+    -DLOCATION_LAT=0.0000
+    -DLOCATION_LON=0.0000
+
+; --- Environments ---
+; env:auto   - tries all known networks automatically (recommended)
+; env:home   - connects to home network only
+; env:office - connects to office network only
+
+[env:auto]
+build_flags =
+    ${env.build_flags}
+    -DWIFI_SSID_1=\"YOUR_HOME_SSID\"
+    -DWIFI_PASS_1=\"YOUR_HOME_PASSWORD\"
+    -DWIFI_SSID_2=\"YOUR_OFFICE_SSID\"
+    -DWIFI_PASS_2=\"YOUR_OFFICE_PASSWORD\"
+
+[env:home]
+build_flags =
+    ${env.build_flags}
+    -DWIFI_SSID=\"YOUR_HOME_SSID\"
+    -DWIFI_PASS=\"YOUR_HOME_PASSWORD\"
+
+[env:office]
+build_flags =
+    ${env.build_flags}
+    -DWIFI_SSID=\"YOUR_OFFICE_SSID\"
+    -DWIFI_PASS=\"YOUR_OFFICE_PASSWORD\"
+
+; env:i2c_scan - scans I2C bus and identifies connected devices (no WiFi/MQTT needed)
+[env:i2c_scan]
+build_flags =
+    -DENV_I2C_SCAN
+build_src_filter = -<main.cpp> +<i2c_scan.cpp>
