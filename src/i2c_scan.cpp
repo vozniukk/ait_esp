@@ -1,15 +1,18 @@
 /* i2c_scan.cpp — I2C bus scanner for ESP32
    Build via env:i2c_scan (does NOT interfere with main.cpp).
-   Wiring: SDA=GPIO21  SCL=GPIO22  (default ESP32 pins)
-   Scans all 127 addresses every 4 s and identifies common devices.       */
+   Bus 0 (Wire):  SDA=GPIO21  SCL=GPIO22  (default ESP32 pins)
+   Bus 1 (Wire1): SDA=GPIO25  SCL=GPIO26
+   Scans all 127 addresses on both buses every 4 s.                       */
 
 #ifdef ENV_I2C_SCAN   // guard: compiled only in the i2c_scan environment
 
 #include <Arduino.h>
 #include <Wire.h>
 
-#define SDA_PIN 21
-#define SCL_PIN 22
+#define SDA_PIN  21
+#define SCL_PIN  22
+#define SDA2_PIN 25
+#define SCL2_PIN 26
 #define I2C_FREQ 100000UL   // 100 kHz — safe for all devices
 
 /* ── Known-device table ────────────────────────────────────────────────── */
@@ -43,9 +46,10 @@ static const KnownDevice KNOWN[] = {
     { 0x53, "ADXL345 accelerometer (ADDR=GND)" },
     { 0x57, "MAX30102 pulse ox / AT24C32 (DS3231 board)" },
     { 0x5C, "BH1750 light (ADDR=GND)" },
+    { 0x36, "MAX17048 / MAX17049 fuel gauge" },
     { 0x60, "Si5351 clock gen / MCP4725 DAC (A0=0)" },
     { 0x61, "MCP4725 DAC (A0=1)" },
-    { 0x62, "SCD30 CO2 sensor" },
+    { 0x62, "SCD30 / SCD41 CO2 sensor" },
     { 0x63, "Si1145 UV/IR/vis light" },
     { 0x68, "DS3231 RTC / MPU-6050 / MPU-9250 (AD0=0)" },
     { 0x69, "MPU-6050 / MPU-9250 IMU (AD0=1)" },
@@ -65,47 +69,92 @@ static const char* identify(uint8_t addr) {
     return "unknown device";
 }
 
-/* ── Read a single register from a device ──────────────────────────────── */
-static uint8_t readReg(uint8_t devAddr, uint8_t reg) {
-    Wire.beginTransmission(devAddr);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) return 0xFF;
-    Wire.requestFrom(devAddr, (uint8_t)1);
-    return Wire.available() ? Wire.read() : 0xFF;
+/* ── Read a single register from a device on a given bus ───────────────── */
+static uint8_t readReg(TwoWire& bus, uint8_t devAddr, uint8_t reg) {
+    bus.beginTransmission(devAddr);
+    bus.write(reg);
+    if (bus.endTransmission(false) != 0) return 0xFF;
+    bus.requestFrom(devAddr, (uint8_t)1);
+    return bus.available() ? bus.read() : 0xFF;
 }
 
 /* ── Probe known addresses to confirm chip identity ────────────────────── */
-static void probeDevice(uint8_t addr) {
+static void probeDevice(TwoWire& bus, uint8_t addr) {
     switch (addr) {
+        case 0x36: {
+            /* MAX17048 VERSION register 0x08 → upper nibble 0x001x */
+            bus.beginTransmission(0x36);
+            bus.write(0x08);
+            if (bus.endTransmission(false) == 0) {
+                bus.requestFrom((uint8_t)0x36, (uint8_t)2);
+                if (bus.available() >= 2) {
+                    uint16_t ver = ((uint16_t)bus.read() << 8) | bus.read();
+                    if      ((ver & 0xFFF0) == 0x0010)
+                        Serial.printf("         \u21b3 version=0x%04X  \u2192 MAX17048 fuel gauge confirmed\n", ver);
+                    else if ((ver & 0xFFF0) == 0x0020)
+                        Serial.printf("         \u21b3 version=0x%04X  \u2192 MAX17049 fuel gauge\n", ver);
+                    else
+                        Serial.printf("         \u21b3 version=0x%04X  \u2192 MAX1704x-family fuel gauge\n", ver);
+                }
+            }
+            break;
+        }
         case 0x53: {
             /* ADXL345 DEVID register 0x00 → 0xE5 */
-            uint8_t id = readReg(0x53, 0x00);
+            uint8_t id = readReg(bus, 0x53, 0x00);
             if      (id == 0xE5) Serial.printf("         ↳ chip_id=0x%02X  → ADXL345 confirmed\n", id);
-            else                 Serial.printf("         ↳ chip_id=0x%02X  → NOT ADXL345 (unknown at 0x53)\n", id);
+            else                 Serial.printf("         ↳ chip_id=0x%02X  → NOT ADXL345 (ENS160 or other at 0x53)\n", id);
+            break;
+        }
+        case 0x5A:
+        case 0x5B: {
+            /* CCS811 HW_ID register 0x20 → 0x81 */
+            uint8_t id = readReg(bus, addr, 0x20);
+            if (id == 0x81) Serial.printf("         ↳ chip_id=0x%02X  → CCS811 confirmed\n", id);
+            else            Serial.printf("         ↳ chip_id=0x%02X  → NOT CCS811 (unexpected)\n", id);
             break;
         }
         case 0x62: {
-            /* SCD30 firmware version command 0xD100, reply: major, minor, CRC */
-            Wire.beginTransmission(0x62);
-            Wire.write(0xD1); Wire.write(0x00);
-            if (Wire.endTransmission() == 0) {
-                delay(4);
-                Wire.requestFrom((uint8_t)0x62, (uint8_t)3);
-                if (Wire.available() >= 3) {
-                    uint8_t maj = Wire.read(), min = Wire.read(); Wire.read();
+            /* SCD4x: stop periodic measurement first (in case it's still running) */
+            bus.beginTransmission(0x62);
+            bus.write(0x3F); bus.write(0x86);  // stop_periodic_measurement
+            bus.endTransmission();
+            delay(500);  // SCD41 requires 500 ms after stop
+
+            /* SCD41 get_serial_number 0x3682, response 9 bytes */
+            bus.beginTransmission(0x62);
+            bus.write(0x36); bus.write(0x82);
+            int err41 = bus.endTransmission();
+            if (err41 == 0) {
+                delay(10);
+                uint8_t got = bus.requestFrom((uint8_t)0x62, (uint8_t)9);
+                if (got >= 9) {
+                    Serial.println("         ↳ SCD41 confirmed (serial number OK)");
+                    break;
+                }
+                while (bus.available()) bus.read();
+            }
+            /* Fallback: SCD30 firmware-version 0xD100, response 3 bytes */
+            bus.beginTransmission(0x62);
+            bus.write(0xD1); bus.write(0x00);
+            if (bus.endTransmission() == 0) {
+                delay(10);
+                bus.requestFrom((uint8_t)0x62, (uint8_t)3);
+                if (bus.available() >= 3) {
+                    uint8_t maj = bus.read(), min = bus.read(); bus.read();
                     Serial.printf("         ↳ SCD30 firmware v%d.%d confirmed\n", maj, min);
                 } else {
-                    Serial.println("         ↳ SCD30 firmware read failed (not SCD30?)");
+                    Serial.println("         ↳ SCD30/SCD41 present — identify failed");
                 }
             } else {
-                Serial.println("         ↳ SCD30 command failed");
+                Serial.printf("         ↳ SCD41 cmd err=%d; SCD30 fallback NAK'd\n", err41);
             }
             break;
         }
         case 0x76:
         case 0x77: {
             /* BME/BMP register 0xD0 (chip_id) */
-            uint8_t id = readReg(addr, 0xD0);
+            uint8_t id = readReg(bus, addr, 0xD0);
             const char* chip;
             switch (id) {
                 case 0x60: chip = "BME280"; break;
@@ -122,19 +171,19 @@ static void probeDevice(uint8_t addr) {
     }
 }
 
-/* ── Scan ──────────────────────────────────────────────────────────────── */
-static void scanBus() {
+/* ── Scan one bus ───────────────────────────────────────────────────────── */
+static void scanBus(TwoWire& bus, uint8_t sda, uint8_t scl) {
     Serial.println("\n══════════════════════════════════════════");
-    Serial.printf(  "  I2C scan  SDA=GPIO%d  SCL=GPIO%d\n", SDA_PIN, SCL_PIN);
+    Serial.printf(  "  I2C scan  SDA=GPIO%d  SCL=GPIO%d\n", sda, scl);
     Serial.println("══════════════════════════════════════════");
 
     int found = 0;
     for (uint8_t addr = 1; addr < 127; addr++) {
-        Wire.beginTransmission(addr);
-        uint8_t err = Wire.endTransmission();
+        bus.beginTransmission(addr);
+        uint8_t err = bus.endTransmission();
         if (err == 0) {
             Serial.printf("  0x%02X (%3d)  →  %s\n", addr, addr, identify(addr));
-            probeDevice(addr);
+            probeDevice(bus, addr);
             found++;
         } else if (err == 4) {
             Serial.printf("  0x%02X (%3d)  →  ERROR (bus locked?)\n", addr, addr);
@@ -153,11 +202,13 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Wire.begin(SDA_PIN, SCL_PIN, I2C_FREQ);
-    Serial.println("ESP32 I2C Scanner ready.");
+    Wire1.begin(SDA2_PIN, SCL2_PIN, I2C_FREQ);
+    Serial.println("ESP32 dual-bus I2C Scanner ready.");
 }
 
 void loop() {
-    scanBus();
+    scanBus(Wire,  SDA_PIN,  SCL_PIN);
+    scanBus(Wire1, SDA2_PIN, SCL2_PIN);
     delay(4000);
 }
 
