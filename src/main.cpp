@@ -32,7 +32,10 @@
 #define EPD_SCK     16
 #define EPD_MOSI    23
 #define WIFI_TIMEOUT_MS     15000UL   // max time to wait for WiFi connection
-#define SAMPLE_INTERVAL_MS  30000UL   // collect a sample every 30 s (WiFi OFF)
+#define SAMPLE_INTERVAL_MS  30000UL   // sensor sample every 30 s = every 2nd wake
+#define WAKE_INTERVAL_MS    15000UL   // actual deep-sleep interval (15 s)
+#define KEEPALIVE_PIN       13        // GPIO pulled LOW 500 ms on every wakeup
+#define KEEPALIVE_PULSE_MS  500UL     // duration of keep-alive LOW pulse
 #define COLLECT_DURATION_MS 300000UL  // 5 minutes of collecting before transmit
 #define MAX_SAMPLES         15        // 5min/30s = 10 samples; 15 is safe margin
 #define NTP_SERVER1         "pool.ntp.org"
@@ -44,7 +47,7 @@
 // ── SCD41 diagnostics mode ────────────────────────────────────────────────
 // Define to run full SCD41 self-test + config dump on cold boot.
 // Deep sleep is disabled while this is active so output stays visible.
-#define SCD41_DIAG
+// #define SCD41_DIAG   // RESULT: Self-test FAIL 0x00C4 — sensor hardware defective, replace SCD41
 
 /* ── Sample buffer ─────────────────────────────────────────────────────────
    All sensor readings captured at sample time; RSSI at transmit time.
@@ -62,7 +65,8 @@ struct Sample {
     unsigned long capturedAt_ms;
 };
 RTC_DATA_ATTR static Sample buf[MAX_SAMPLES];
-RTC_DATA_ATTR static int    bufCount = 0;
+RTC_DATA_ATTR static int    bufCount  = 0;
+RTC_DATA_ATTR static int    wakeCount = 0;  // increments every wakeup; even = sensor wake
 
 /* MAX17048 — read battery voltage and state of charge over Wire1.
    VCELL register 0x02: 16-bit, 1 LSB = 78.125 µV → divide by 12800 to get V.
@@ -445,14 +449,34 @@ void setup() {
 
 
     if (coldBoot) {
-        bufCount = 0;   // RTC memory is 0 on power-on, but be explicit
+        bufCount  = 0;  // RTC memory is 0 on power-on, but be explicit
+        wakeCount = 0;
         Serial.printf("\nCOLD BOOT  CPU=%uMHz  chip_temp=%.1f°C\n",
                       getCpuFrequencyMhz(), temperatureRead());
-        Serial.printf("Cycle: collect %lus | sample every %lus | buffer %d slots\n",
-                      COLLECT_DURATION_MS / 1000, SAMPLE_INTERVAL_MS / 1000, MAX_SAMPLES);
+        Serial.printf("Cycle: collect %lus | sample every %lus | wake every %lus | buffer %d slots\n",
+                      COLLECT_DURATION_MS / 1000, SAMPLE_INTERVAL_MS / 1000, WAKE_INTERVAL_MS / 1000, MAX_SAMPLES);
     } else {
-        Serial.printf("\nWAKE [%d/%d]  CPU=%uMHz\n",
-                      bufCount + 1, MAX_SAMPLES, getCpuFrequencyMhz());
+        Serial.printf("\nWAKE [%d/%d]  wakeCount=%d  CPU=%uMHz\n",
+                      bufCount + 1, MAX_SAMPLES, wakeCount, getCpuFrequencyMhz());
+    }
+
+    /* ── Keep-alive pulse — GPIO13 LOW for 500 ms on every wakeup ───── */
+    pinMode(KEEPALIVE_PIN, OUTPUT);
+    digitalWrite(KEEPALIVE_PIN, LOW);
+    delay(KEEPALIVE_PULSE_MS);
+    digitalWrite(KEEPALIVE_PIN, HIGH);
+
+    /* ── Keepalive-only wakeups (odd wakeCount) — skip sensor read ─── */
+    if (wakeCount % 2 != 0) {
+        Serial.printf("Keepalive wake %d → sleep\n", wakeCount);
+        Serial.flush();
+        wakeCount++;
+        unsigned long elapsed = millis() - wakeStart;
+        uint64_t sleepUs = (WAKE_INTERVAL_MS > elapsed)
+                           ? (uint64_t)(WAKE_INTERVAL_MS - elapsed) * 1000ULL
+                           : 100000ULL;
+        esp_sleep_enable_timer_wakeup(sleepUs);
+        esp_deep_sleep_start();
     }
 
     /* ── I2C buses ───────────────────────────────────────────────────── */
@@ -756,13 +780,13 @@ void setup() {
 
     /* ── Deep sleep until next sample interval ───────────────────────── */
 #ifdef SCD41_DIAG
-    Serial.println("[DIAG] Deep sleep DISABLED — reset ESP to restart.");
+    Serial.println("[DIAG] Diagnostic done — continuing to normal operation.");
     Serial.flush();
-    while (true) { delay(1000); }   // halt; inspect output, then reset manually
 #endif
+    wakeCount++;
     unsigned long elapsed = millis() - wakeStart;
-    uint64_t sleepUs = (SAMPLE_INTERVAL_MS > elapsed)
-                       ? (uint64_t)(SAMPLE_INTERVAL_MS - elapsed) * 1000ULL
+    uint64_t sleepUs = (WAKE_INTERVAL_MS > elapsed)
+                       ? (uint64_t)(WAKE_INTERVAL_MS - elapsed) * 1000ULL
                        : 100000ULL;    // 100 ms minimum if processing overran
     Serial.printf("Awake %lu ms → sleeping %llu ms.\n", elapsed, sleepUs / 1000ULL);
     Serial.flush();
